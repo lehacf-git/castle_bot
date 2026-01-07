@@ -17,6 +17,16 @@ from .reporting import write_json
 app = typer.Typer(add_completion=False)
 console = Console()
 
+# Valid modes
+VALID_MODES = {"test", "paper", "training", "demo", "prod"}
+
+def _validate_mode(mode: str) -> str:
+    """Validate and return normalized mode."""
+    m = mode.lower().strip()
+    if m not in VALID_MODES:
+        raise typer.BadParameter(f"mode must be one of: {', '.join(sorted(VALID_MODES))}")
+    return m
+
 @app.command()
 def init_db_cmd():
     """Create DB tables."""
@@ -29,20 +39,40 @@ def init_db_cmd():
 @app.command()
 def run(
     minutes: int = typer.Option(5, help="How long to run the loop."),
-    mode: str = typer.Option(None, help="paper|demo|prod (overrides env CASTLE_MODE)."),
-    limit_markets: int = typer.Option(40, help="How many open markets to scan each cycle."),
+    mode: str = typer.Option(None, help="test|paper|training|demo|prod (overrides env CASTLE_MODE)."),
+    limit_markets: int = typer.Option(100, help="How many open markets to scan each cycle."),
 ):
-    """Run the bot."""
+    """
+    Run the bot in one of these modes:
+    
+    - test: Demo environment API validation, no trading
+    - paper: Simulate fills locally, no real trading
+    - training: Production market data, no trading (for research)
+    - demo: Place real orders in Kalshi demo environment
+    - prod: Place real orders in Kalshi production environment
+    """
     s = get_settings()
     setup_logging(s.log_level)
     engine = make_engine(s.db_url)
     init_db(engine)
 
-    m = (mode or s.mode).lower().strip()
-    if m not in {"paper", "demo", "prod"}:
-        raise typer.BadParameter("mode must be paper|demo|prod")
+    m = _validate_mode(mode or s.mode)
+    
+    # Safety check: prod/demo require explicit confirmation
+    if m in {"prod", "demo"}:
+        console.print(f"[yellow bold]WARNING: You are about to run in {m.upper()} mode![/yellow bold]")
+        console.print(f"This will place REAL orders in the Kalshi {m} environment.")
+        confirm = typer.confirm("Are you sure you want to continue?")
+        if not confirm:
+            raise typer.Abort()
 
-    run_dir = run_loop(engine=engine, settings=s, minutes=minutes, mode=m, limit_markets=limit_markets)
+    run_dir = run_loop(
+        engine=engine,
+        settings=s,
+        minutes=minutes,
+        mode=m,
+        limit_markets=limit_markets
+    )
     console.print(f"[green]Run complete[/green]: {run_dir}")
 
 @app.command()
@@ -74,6 +104,7 @@ def report(run_id: str = typer.Argument(..., help="Run id folder name under runs
     table.add_column("Value")
 
     table.add_row("Mode", str(summary.get("mode")))
+    table.add_row("Env", str(summary.get("env", "unknown")))
     table.add_row("Trades", str(summary.get("trades")))
     table.add_row("Decisions", str(summary.get("decisions")))
 
@@ -87,9 +118,12 @@ def report(run_id: str = typer.Argument(..., help="Run id folder name under runs
             table.add_row("MTM wins/losses/flats", f"{wins}/{losses}/{flats}")
         if pnl_usd is not None:
             table.add_row("MTM P&L (usd)", str(pnl_usd))
+        
         diag = run_summary.get("diagnostics") or {}
-        if "estimated_trades_if_taker_enabled" in diag:
-            table.add_row("Est. trades if taker enabled", str(diag["estimated_trades_if_taker_enabled"]))
+        if diag:
+            table.add_row("Markets scanned", str(diag.get("markets_scanned", 0)))
+            table.add_row("Markets with books", str(diag.get("markets_with_orderbooks", 0)))
+            table.add_row("Skip reasons (top 3)", str(diag.get("top_skip_reasons", [])))
 
     if not equity.empty:
         table.add_row("Last exposure_usd", str(equity.iloc[-1].get("exposure_usd")))
@@ -130,7 +164,7 @@ app.add_typer(improve_app, name="improve")
 
 @improve_app.command("propose")
 def improve_propose(run_id: str = typer.Option(..., "--run-id", help="Run id to base the proposal on")):
-    """Ask the codegen model (Gemini) to propose file edits based on requirements + run metrics."""
+    """Ask the codegen model to propose file edits based on requirements + run metrics."""
     s = get_settings()
     provider = (s.codegen_provider or "openai").lower().strip()
     if provider == "openai" and not s.openai_api_key:
@@ -157,8 +191,9 @@ def improve_apply(
 
 @improve_app.command("cycle")
 def improve_cycle(
-    minutes: int = typer.Option(10, "--minutes", help="Minutes to run the bot in this cycle (paper/demo/prod per config)."),
-    limit_markets: int = typer.Option(40, "--limit-markets", help="How many markets to scan each loop."),
+    minutes: int = typer.Option(10, "--minutes", help="Minutes to run the bot in this cycle."),
+    limit_markets: int = typer.Option(100, "--limit-markets", help="How many markets to scan each loop."),
+    mode: str = typer.Option("paper", "--mode", help="Mode to run in (paper/training recommended for automation)."),
 ):
     """Run -> eval -> propose (does NOT auto-apply)."""
     s = get_settings()
@@ -172,9 +207,10 @@ def improve_cycle(
     engine = make_engine(s.db_url)
     init_db(engine)
 
+    m = _validate_mode(mode)
+
     # Run
     from .runner import run_loop
-    m = (s.mode or "paper").lower().strip()
     run_dir = run_loop(engine=engine, settings=s, minutes=minutes, mode=m, limit_markets=limit_markets)
     run_id = run_dir.name
 

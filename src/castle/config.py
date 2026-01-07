@@ -61,6 +61,10 @@ class Settings:
     maker_only: bool
     est_taker_fee_cents_per_contract: int
 
+    # Strategy enhancements
+    decision_cooldown_seconds: int
+    enable_taker_test: bool  # For paper/training: test taker logic even if maker_only=true
+
     # News (RSS)
     news_feeds: List[str]
     news_lookback_hours: int
@@ -112,6 +116,9 @@ def get_settings() -> Settings:
         min_depth_contracts=_int("MIN_DEPTH_CONTRACTS", 50),
         maker_only=_bool("MAKER_ONLY", True),
         est_taker_fee_cents_per_contract=_int("EST_TAKER_FEE_CENTS_PER_CONTRACT", 2),
+
+        decision_cooldown_seconds=_int("DECISION_COOLDOWN_SECONDS", 60),
+        enable_taker_test=_bool("ENABLE_TAKER_TEST", False),
 
         news_feeds=_list_csv("NEWS_FEEDS"),
         news_lookback_hours=_int("NEWS_LOOKBACK_HOURS", 24),
