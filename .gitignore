@@ -10,3 +10,6 @@ proposals/
 
 tmp/
 .env
+*.pem
+.DS_Store
+*.swp
