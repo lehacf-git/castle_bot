@@ -1,8 +1,16 @@
+"""
+Castle Bot CLI - Command Line Interface
+
+Supports modes:
+- paper: Simulated fills, no real trading
+- training: Real market data, logs "would_trade", no execution  
+- demo: Real trades on Kalshi demo environment
+- prod: Real trades on Kalshi production (REAL MONEY!)
+"""
 from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
 import typer
@@ -18,6 +26,7 @@ from .reporting import write_json
 app = typer.Typer(add_completion=False)
 console = Console()
 
+
 @app.command()
 def init_db_cmd():
     """Create DB tables."""
@@ -27,34 +36,43 @@ def init_db_cmd():
     init_db(engine)
     console.print(f"[green]DB initialized[/green] at {s.db_url}")
 
+
 @app.command()
 def run(
     minutes: int = typer.Option(5, help="How long to run the loop."),
-    mode: str = typer.Option(None, help="paper|demo|prod (overrides env CASTLE_MODE)."),
+    mode: str = typer.Option(None, help="paper|training|demo|prod (overrides env CASTLE_MODE)."),
     limit_markets: int = typer.Option(40, help="How many open markets to scan each cycle."),
-    min_volume: int = typer.Option(0, help="Minimum 24h volume filter."),
-    min_open_interest: int = typer.Option(50, help="Minimum open interest filter."),
 ):
-    """Run the bot."""
+    """Run the bot.
+    
+    Modes:
+    - paper: Simulate trades (safe, default)
+    - training: Use real prod data, log "would_trade", no execution
+    - demo: Trade in Kalshi demo environment
+    - prod: Trade with REAL MONEY in production
+    """
     s = get_settings()
     setup_logging(s.log_level)
     engine = make_engine(s.db_url)
     init_db(engine)
 
     m = (mode or s.mode).lower().strip()
-    if m not in {"paper", "demo", "prod"}:
-        raise typer.BadParameter("mode must be paper|demo|prod")
+    if m not in {"paper", "training", "demo", "prod"}:
+        raise typer.BadParameter("mode must be paper|training|demo|prod")
 
-    run_dir = run_loop(
-        engine=engine,
-        settings=s,
-        minutes=minutes,
-        mode=m,
-        limit_markets=limit_markets,
-        min_volume_24h=min_volume,
-        min_open_interest=min_open_interest
-    )
+    # Warn about dangerous modes
+    if m == "prod":
+        console.print("[bold red]⚠️  PRODUCTION MODE - REAL MONEY TRADING[/bold red]")
+        console.print("[yellow]Press Ctrl+C within 5 seconds to cancel...[/yellow]")
+        import time
+        time.sleep(5)
+    elif m == "training":
+        console.print("[bold blue]🎓 TRAINING MODE[/bold blue]")
+        console.print("[blue]Using production data - NO orders will be placed[/blue]")
+
+    run_dir = run_loop(engine=engine, settings=s, minutes=minutes, mode=m, limit_markets=limit_markets)
     console.print(f"[green]Run complete[/green]: {run_dir}")
+
 
 @app.command()
 def report(run_id: str = typer.Argument(..., help="Run id folder name under runs/")):
@@ -79,6 +97,7 @@ def report(run_id: str = typer.Argument(..., help="Run id folder name under runs
     trades = _read_csv_safe(runs_dir / "trades.csv")
     equity = _read_csv_safe(runs_dir / "equity.csv")
     run_summary = json.loads((runs_dir / "run_summary.json").read_text(encoding="utf-8")) if (runs_dir / "run_summary.json").exists() else {}
+    training_summary = json.loads((runs_dir / "training_summary.json").read_text(encoding="utf-8")) if (runs_dir / "training_summary.json").exists() else {}
 
     table = Table(title=f"Run {run_id}")
     table.add_column("Metric")
@@ -87,6 +106,13 @@ def report(run_id: str = typer.Argument(..., help="Run id folder name under runs
     table.add_row("Mode", str(summary.get("mode")))
     table.add_row("Trades", str(summary.get("trades")))
     table.add_row("Decisions", str(summary.get("decisions")))
+
+    # Training mode specific
+    if summary.get("mode") == "training" and training_summary:
+        table.add_row("Would-Trades", str(training_summary.get("total_would_trades", 0)))
+        table.add_row("Hypothetical Cost", f"${training_summary.get('total_hypothetical_cost_usd', 0):.2f}")
+        table.add_row("Avg Edge", f"{training_summary.get('avg_edge', 0):.4f}")
+        table.add_row("Unique Tickers", str(training_summary.get("unique_tickers", 0)))
 
     if run_summary:
         mtm = run_summary.get("mtm_proxy") or {}
@@ -105,6 +131,7 @@ def report(run_id: str = typer.Argument(..., help="Run id folder name under runs
     if not equity.empty:
         table.add_row("Last exposure_usd", str(equity.iloc[-1].get("exposure_usd")))
         table.add_row("Last mtm_value_usd", str(equity.iloc[-1].get("mtm_value_usd")))
+    
     console.print(table)
 
 
@@ -136,22 +163,35 @@ def eval(run_id: str = typer.Argument(..., help="Run id folder name under runs/"
     m = compute_metrics(run_dir)
     console.print_json(json.dumps(metrics_to_dict(m), indent=2))
 
+
+# Improve subcommands
 improve_app = typer.Typer(help="Spec-driven improvement workflow (propose/apply).")
 app.add_typer(improve_app, name="improve")
 
+
 @improve_app.command("propose")
 def improve_propose(run_id: str = typer.Option(..., "--run-id", help="Run id to base the proposal on")):
-    """Ask the codegen model (Gemini) to propose file edits based on requirements + run metrics."""
+    """Ask Claude to propose file edits based on requirements + run metrics."""
     s = get_settings()
-    provider = (s.codegen_provider or "openai").lower().strip()
-    if provider == "openai" and not s.openai_api_key:
-        raise typer.BadParameter("OPENAI_API_KEY is not set in your environment/.env")
-    if provider == "gemini" and not s.gemini_api_key:
-        raise typer.BadParameter("GEMINI_API_KEY is not set in your environment/.env")
+    
+    # Check for API keys based on provider
+    provider = getattr(s, 'codegen_provider', 'anthropic').lower().strip()
+    
+    if provider == "anthropic":
+        if not getattr(s, 'anthropic_api_key', None):
+            raise typer.BadParameter("ANTHROPIC_API_KEY is not set in your environment/.env")
+    elif provider == "openai":
+        if not s.openai_api_key:
+            raise typer.BadParameter("OPENAI_API_KEY is not set in your environment/.env")
+    elif provider == "gemini":
+        if not s.gemini_api_key:
+            raise typer.BadParameter("GEMINI_API_KEY is not set in your environment/.env")
+    
     from .improve.proposer import propose
-    repo_root = Path(__file__).resolve().parents[2]  # repo root when installed editable
+    repo_root = Path(__file__).resolve().parents[2]
     res = propose(s, repo_root=repo_root, run_id=run_id)
     console.print(f"[green]Proposal created[/green]: {res.proposal_id} at {res.proposal_dir}")
+
 
 @improve_app.command("apply")
 def improve_apply(
@@ -166,17 +206,22 @@ def improve_apply(
         raise typer.Exit(code=1)
     console.print(f"[green]{res.message}[/green] Applied files: {len(res.applied_files)}")
 
+
 @improve_app.command("cycle")
 def improve_cycle(
-    minutes: int = typer.Option(10, "--minutes", help="Minutes to run the bot in this cycle (paper/demo/prod per config)."),
+    minutes: int = typer.Option(10, "--minutes", help="Minutes to run the bot in this cycle."),
     limit_markets: int = typer.Option(40, "--limit-markets", help="How many markets to scan each loop."),
 ):
     """Run -> eval -> propose (does NOT auto-apply)."""
     s = get_settings()
-    provider = (s.codegen_provider or "openai").lower().strip()
-    if provider == "openai" and not s.openai_api_key:
+    
+    # Check for API keys
+    provider = getattr(s, 'codegen_provider', 'anthropic').lower().strip()
+    if provider == "anthropic" and not getattr(s, 'anthropic_api_key', None):
+        raise typer.BadParameter("ANTHROPIC_API_KEY is not set in your environment/.env")
+    elif provider == "openai" and not s.openai_api_key:
         raise typer.BadParameter("OPENAI_API_KEY is not set in your environment/.env")
-    if provider == "gemini" and not s.gemini_api_key:
+    elif provider == "gemini" and not s.gemini_api_key:
         raise typer.BadParameter("GEMINI_API_KEY is not set in your environment/.env")
 
     setup_logging(s.log_level)
@@ -199,199 +244,6 @@ def improve_cycle(
     repo_root = Path(__file__).resolve().parents[2]
     res = propose(s, repo_root=repo_root, run_id=run_id)
     console.print(f"[green]Proposal created[/green]: {res.proposal_id} at {res.proposal_dir}")
-
-
-# Resource management commands
-resources_app = typer.Typer(help="Manage resource requests from autonomous improvement")
-app.add_typer(resources_app, name="resources")
-
-
-@resources_app.command("list")
-def resources_list(
-    priority: str = typer.Option(None, help="Filter by priority: critical|high|medium|low"),
-    status: str = typer.Option("pending", help="Filter by status: pending|approved|implemented|rejected")
-):
-    """List resource requests."""
-    from .improve.resource_requests import ResourceRequestManager, Priority
-    
-    repo_root = Path(__file__).resolve().parents[2]
-    manager = ResourceRequestManager(repo_root / "resource_requests.json")
-    
-    requests = manager.requests
-    
-    # Filter by status
-    if status:
-        requests = [r for r in requests if r.status == status]
-    
-    # Filter by priority
-    if priority:
-        priority_enum = Priority(priority.lower())
-        requests = [r for r in requests if r.priority == priority_enum]
-    
-    if not requests:
-        console.print("[yellow]No matching requests found[/yellow]")
-        return
-    
-    # Display table
-    table = Table(title=f"Resource Requests ({status})")
-    table.add_column("ID")
-    table.add_column("Priority")
-    table.add_column("Type")
-    table.add_column("Title")
-    table.add_column("Expected Impact")
-    
-    for req in requests:
-        table.add_row(
-            req.request_id[-12:],
-            req.priority.value.upper(),
-            req.resource_type.value,
-            req.title[:40],
-            req.expected_improvement[:50]
-        )
-    
-    console.print(table)
-
-
-@resources_app.command("view")
-def resources_view(request_id: str = typer.Argument(..., help="Request ID to view")):
-    """View detailed information about a resource request."""
-    from .improve.resource_requests import ResourceRequestManager
-    
-    repo_root = Path(__file__).resolve().parents[2]
-    manager = ResourceRequestManager(repo_root / "resource_requests.json")
-    
-    req = None
-    for r in manager.requests:
-        if r.request_id == request_id or r.request_id.endswith(request_id):
-            req = r
-            break
-    
-    if not req:
-        console.print(f"[red]Request {request_id} not found[/red]")
-        raise typer.Exit(1)
-    
-    # Display detailed info
-    console.print(f"\n[bold]Resource Request: {req.title}[/bold]")
-    console.print(f"ID: {req.request_id}")
-    console.print(f"Priority: {req.priority.value.upper()}")
-    console.print(f"Type: {req.resource_type.value}")
-    console.print(f"Status: {req.status}")
-    console.print(f"Requested: {req.timestamp.strftime('%Y-%m-%d %H:%M UTC')}\n")
-    
-    console.print("[bold]Description:[/bold]")
-    console.print(req.description + "\n")
-    
-    console.print("[bold]Justification:[/bold]")
-    console.print(req.justification + "\n")
-    
-    console.print("[bold]Expected Improvement:[/bold]")
-    console.print(req.expected_improvement + "\n")
-    
-    console.print("[bold]Cost Estimate:[/bold]")
-    console.print(req.cost_estimate + "\n")
-    
-    if req.alternatives:
-        console.print("[bold]Alternatives:[/bold]")
-        for alt in req.alternatives:
-            console.print(f"  • {alt}")
-        console.print()
-
-
-@resources_app.command("approve")
-def resources_approve(
-    request_id: str = typer.Argument(..., help="Request ID to approve"),
-    notes: str = typer.Option("", help="Optional approval notes")
-):
-    """Approve a resource request."""
-    from .improve.resource_requests import ResourceRequestManager
-    
-    repo_root = Path(__file__).resolve().parents[2]
-    manager = ResourceRequestManager(repo_root / "resource_requests.json")
-    
-    # Support partial IDs
-    full_id = None
-    for r in manager.requests:
-        if r.request_id == request_id or r.request_id.endswith(request_id):
-            full_id = r.request_id
-            break
-    
-    if not full_id:
-        console.print(f"[red]Request {request_id} not found[/red]")
-        raise typer.Exit(1)
-    
-    manager.approve_request(full_id, operator_notes=notes)
-    console.print(f"[green]✓[/green] Request {full_id} approved")
-
-
-@resources_app.command("reject")
-def resources_reject(
-    request_id: str = typer.Argument(..., help="Request ID to reject"),
-    reason: str = typer.Option(..., "--reason", help="Reason for rejection")
-):
-    """Reject a resource request."""
-    from .improve.resource_requests import ResourceRequestManager
-    
-    repo_root = Path(__file__).resolve().parents[2]
-    manager = ResourceRequestManager(repo_root / "resource_requests.json")
-    
-    # Support partial IDs
-    full_id = None
-    for r in manager.requests:
-        if r.request_id == request_id or r.request_id.endswith(request_id):
-            full_id = r.request_id
-            break
-    
-    if not full_id:
-        console.print(f"[red]Request {request_id} not found[/red]")
-        raise typer.Exit(1)
-    
-    manager.reject_request(full_id, reason=reason)
-    console.print(f"[red]✗[/red] Request {full_id} rejected")
-
-
-@resources_app.command("export")
-def resources_export(
-    output: str = typer.Option("RESOURCE_REQUESTS.md", help="Output file path")
-):
-    """Export pending requests for operator review."""
-    from .improve.resource_requests import ResourceRequestManager
-    
-    repo_root = Path(__file__).resolve().parents[2]
-    manager = ResourceRequestManager(repo_root / "resource_requests.json")
-    
-    output_path = Path(output)
-    manager.export_for_operator(output_path)
-    
-    console.print(f"[green]✓[/green] Exported to {output_path}")
-    console.print(f"Pending requests: {len(manager.get_pending_requests())}")
-
-
-@app.command()
-def trade_autonomous(
-    mode: str = typer.Option("training", help="training|demo|prod"),
-    minutes: int = typer.Option(60, help="Minutes per cycle"),
-    cycles: int = typer.Option(10, help="Number of improve cycles"),
-    anthropic_key: str = typer.Option(None, "--anthropic-key", help="Anthropic API key"),
-    openai_key: str = typer.Option(None, "--openai-key", help="OpenAI API key"),
-    gemini_key: str = typer.Option(None, "--gemini-key", help="Gemini API key"),
-):
-    """
-    FULLY AUTONOMOUS MULTI-LLM TRADING SYSTEM
-    
-    - Prioritizes hourly/daily markets
-    - Consults 3 LLMs for each decision
-    - Takes profits quickly (10-20% targets)
-    - Claude generates code improvements
-    - Learns from every trade
-    """
-    console.print("[red]ERROR: Autonomous trading system not yet implemented[/red]")
-    console.print("This command requires additional modules:")
-    console.print("  - src/castle/strategy/multi_llm_advisor.py")
-    console.print("  - src/castle/strategy/autonomous_trader.py")
-    console.print("  - src/castle/news/news_aggregator.py")
-    console.print("  - src/castle/improve/resource_requests.py")
-    console.print("\nPlease implement these modules first.")
-    raise typer.Exit(1)
 
 
 if __name__ == "__main__":
