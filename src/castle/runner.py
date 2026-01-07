@@ -1,3 +1,6 @@
+# PATCH for src/castle/runner.py
+# Adds diagnostics, training mode, and skip reason logging
+
 from __future__ import annotations
 
 import datetime as dt
@@ -17,9 +20,10 @@ from .kalshi.client import KalshiClient
 from .models import Market, OrderbookSnapshot, NewsItem, Decision, Trade, Position
 from .news.rss import parse_rss
 from .news.newsapi import fetch_newsapi_everything
-from .strategy.edge_strategy import decide
+from .strategy.edge_strategy import decide, SkipReason
 from .execution.paper import PaperExecutor
 from .execution.kalshi_exec import KalshiExecutor
+from .execution.training import TrainingExecutor
 from .portfolio import PositionState, apply_buy, mark_to_market_usd
 from .logging import setup_logging
 from .reporting import write_csv, write_json, redact_config
@@ -87,23 +91,11 @@ def ingest_news(session: Session, settings: Settings, now: dt.datetime) -> int:
     return inserted
 
 
-def ingest_markets_and_orderbooks(
-    session: Session,
-    kc: KalshiClient,
-    now: dt.datetime,
-    limit_markets: int = 100
-) -> tuple[list[tuple[str, str, list, list]], int, int]:
-    """
-    Returns: (market_data, markets_scanned, markets_with_orderbooks)
-    """
+def ingest_markets_and_orderbooks(session: Session, kc: KalshiClient, now: dt.datetime, limit_markets: int = 50) -> list[tuple[str, str, list, list]]:
     # Grab open markets
     resp = kc.list_markets(status="open", limit=limit_markets)
     markets = resp.get("markets") or []
-    
-    markets_scanned = len(markets)
-    markets_with_books = 0
     out = []
-    
     for m in markets:
         ticker = m.get("ticker")
         title = m.get("title") or ""
@@ -128,11 +120,6 @@ def ingest_markets_and_orderbooks(
             obk = ob.get("orderbook") or {}
             yes = obk.get("yes") or []
             no = obk.get("no") or []
-            
-            # Count markets with non-empty orderbooks
-            if yes or no:
-                markets_with_books += 1
-            
         except Exception as e:
             log.warning("Orderbook failed %s: %s", ticker, e)
             continue
@@ -144,7 +131,7 @@ def ingest_markets_and_orderbooks(
         ))
         out.append((ticker, title, yes, no))
     session.commit()
-    return out, markets_scanned, markets_with_books
+    return out
 
 def load_recent_news(session: Session, now: dt.datetime, lookback_hours: int) -> list[tuple[dt.datetime, str]]:
     start = now - dt.timedelta(hours=lookback_hours)
@@ -172,62 +159,30 @@ def exposure_usd(pos: dict[tuple[str, str], PositionState]) -> float:
         cents += p.qty * p.avg_price_cents
     return cents / 100.0
 
-class DecisionCooldown:
-    """Track recent decisions to prevent churn."""
-    def __init__(self, cooldown_seconds: int = 60):
-        self.cooldown_seconds = cooldown_seconds
-        self.last_decision: dict[str, dt.datetime] = {}
-    
-    def can_decide(self, ticker: str, now: dt.datetime) -> bool:
-        if ticker not in self.last_decision:
-            return True
-        elapsed = (now - self.last_decision[ticker]).total_seconds()
-        return elapsed >= self.cooldown_seconds
-    
-    def record_decision(self, ticker: str, now: dt.datetime):
-        self.last_decision[ticker] = now
-
-def run_loop(
-    *,
-    engine,
-    settings: Settings,
-    minutes: int,
-    mode: str,
-    limit_markets: int = 100
-) -> Path:
-    """
-    Enhanced run loop with:
-    - Training mode support (prod data, no trading)
-    - Comprehensive diagnostics (skip reasons, counters)
-    - Decision cooldown to prevent churn
-    """
-    
-    # Mode validation
+def run_loop(*, engine, settings: Settings, minutes: int, mode: str, limit_markets: int = 40) -> Path:
+    # Validate mode
     valid_modes = {"test", "paper", "training", "demo", "prod"}
     if mode not in valid_modes:
-        raise ValueError(f"Invalid mode: {mode}. Must be one of: {valid_modes}")
+        raise ValueError(f"Invalid mode: {mode}. Must be one of: {', '.join(valid_modes)}")
     
-    # Determine Kalshi environment
-    if mode in {"test", "demo"}:
-        env = "demo"
-    elif mode in {"training", "prod"}:
-        env = "prod"
-    else:  # paper
-        env = settings.kalshi_env  # Use config default for paper
+    # Safety check: training mode requires prod env
+    if mode == "training" and settings.kalshi_env != "prod":
+        log.warning("Training mode works best with KALSHI_ENV=prod. Currently: %s", settings.kalshi_env)
     
-    # Determine if we can trade
-    can_trade = mode in {"demo", "prod"}
-    
-    log.info(f"Starting run loop: mode={mode}, env={env}, can_trade={can_trade}")
+    # Safety check: prod mode requires explicit prod env
+    if mode == "prod" and settings.kalshi_env != "prod":
+        raise ValueError("PROD trading mode requires KALSHI_ENV=prod")
     
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = settings.runs_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     
     # Setup logging to file
+    import os as _os
+    setup_logging(_os.getenv('CASTLE_LOG_LEVEL', 'INFO'), run_dir / 'logs.txt')
+    import logging as _logging
+    _logging.getLogger(__name__).info('Logging to %s', run_dir / 'logs.txt')
     log_file = run_dir / "logs.txt"
-    setup_logging(settings.log_level, log_file)
-    log.info(f'Run started: mode={mode}, env={env}, run_id={run_id}')
 
     # Configure file logging
     fh = logging.FileHandler(log_file, encoding="utf-8")
@@ -235,31 +190,38 @@ def run_loop(
     root = logging.getLogger()
     root.addHandler(fh)
 
+    log.info("=== Starting run %s ===", run_id)
+    log.info("Mode: %s | Env: %s | Minutes: %d", mode, settings.kalshi_env, minutes)
+
     cfg_dump = {k: str(v) for k, v in asdict(settings).items()}
     write_json(run_dir / "config.redacted.json", redact_config(cfg_dump))
 
-    # Select appropriate base URL
-    base_url = settings.kalshi_prod_root if env == "prod" else settings.kalshi_demo_root
-    
+    # Create Kalshi client pointing to the right environment
     kc = KalshiClient(
-        root=base_url,
+        root=settings.get_kalshi_root(),
         key_id=settings.kalshi_key_id or None,
         private_key_path=str(settings.kalshi_private_key_path) if settings.kalshi_private_key_path else None,
     )
 
+    # Initialize executors
     paper = PaperExecutor()
-    live = KalshiExecutor(kc) if can_trade else None
+    training = TrainingExecutor()
+    live = KalshiExecutor(kc) if mode in {"demo", "prod"} else None
+
+    # Diagnostics counters
+    diagnostics = {
+        "markets_seen": 0,
+        "markets_with_orderbooks": 0,
+        "decisions_generated": 0,
+        "orders_attempted": 0,
+        "trades_filled": 0,
+        "skip_reasons": Counter(),
+    }
 
     trades_rows = []
     equity_rows = []
     decisions_rows = []
-    skip_rows = []
-
-    # Diagnostics
-    cooldown = DecisionCooldown(settings.decision_cooldown_seconds)
-    skip_reasons = Counter()
-    total_markets_scanned = 0
-    total_markets_with_books = 0
+    skips_rows = []  # Track skip reasons for analysis
 
     start = _utcnow()
     end = start + dt.timedelta(minutes=minutes)
@@ -270,28 +232,16 @@ def run_loop(
 
         while _utcnow() < end:
             now = _utcnow()
-            
-            # Ingest news
-            news_count = ingest_news(session, settings, now)
-            if news_count > 0:
-                log.info(f"Ingested {news_count} new news items")
-            
+            ingest_news(session, settings, now)
             news = load_recent_news(session, now, settings.news_lookback_hours)
 
-            # Ingest markets and orderbooks
-            md, scanned, with_books = ingest_markets_and_orderbooks(
-                session, kc, now, limit_markets=limit_markets
-            )
-            total_markets_scanned += scanned
-            total_markets_with_books += with_books
+            md = ingest_markets_and_orderbooks(session, kc, now, limit_markets=limit_markets)
+            diagnostics["markets_seen"] += len(md)
+            diagnostics["markets_with_orderbooks"] += sum(1 for _, _, yes, no in md if yes or no)
             
-            log.info(
-                f"Market scan: {scanned} markets scanned, "
-                f"{with_books} with orderbooks, "
-                f"{len(md)} with valid data"
-            )
+            log.info("Cycle: %d markets fetched, %d with non-empty orderbooks", 
+                    len(md), diagnostics["markets_with_orderbooks"])
 
-            # Compute mids for MTM
             mids_yes = {}
             from .strategy.orderbook_math import best_prices, mid_prob
             for ticker, title, yes, no in md:
@@ -302,18 +252,14 @@ def run_loop(
 
             total_expo = exposure_usd(pos)
 
-            decisions_this_cycle = 0
-            skips_this_cycle = 0
-            
+            # Determine effective maker_only based on mode and config
+            effective_maker_only = settings.maker_only
+            if mode in {"paper", "training"} and settings.allow_taker_in_paper:
+                effective_maker_only = False
+                log.debug("Taker mode enabled for %s testing", mode)
+
             for ticker, title, yes, no in md:
-                # Check cooldown
-                if not cooldown.can_decide(ticker, now):
-                    skip_reasons["cooldown"] += 1
-                    skips_this_cycle += 1
-                    continue
-                
-                # Decide
-                cand, skip = decide(
+                decision, skip = decide(
                     ticker=ticker,
                     title=title,
                     yes_bids=yes,
@@ -327,71 +273,67 @@ def run_loop(
                     max_risk_per_market_usd=settings.max_risk_per_market_usd,
                     max_total_exposure_usd=settings.max_total_exposure_usd,
                     current_total_exposure_usd=total_expo,
-                    maker_only=settings.maker_only,
+                    maker_only=effective_maker_only,
                     est_taker_fee_cents_per_contract=settings.est_taker_fee_cents_per_contract,
-                    enable_taker_test=settings.enable_taker_test,
                 )
                 
                 if skip:
-                    skip_reasons[skip.reason] += 1
-                    skips_this_cycle += 1
-                    skip_rows.append({
+                    diagnostics["skip_reasons"][skip.reason] += 1
+                    skips_rows.append({
                         "ts": now.isoformat(),
                         "ticker": skip.ticker,
                         "reason": skip.reason,
-                        "details": json.dumps(skip.details),
+                        "detail": skip.detail,
                     })
                     continue
                 
-                if not cand:
+                if not decision:
                     continue
-                
-                # Record decision
-                cooldown.record_decision(ticker, now)
-                decisions_this_cycle += 1
 
+                diagnostics["decisions_generated"] += 1
+                log.info("Decision: %s %s %s @ %d x%d (edge=%.3f)", 
+                        decision.ticker, decision.side, decision.action,
+                        decision.price_cents, decision.count, decision.edge)
+
+                # Store decision
                 session.add(Decision(
                     run_id=run_id,
                     ts=now,
-                    ticker=cand.ticker,
-                    side=cand.side,
-                    action=cand.action,
-                    price_cents=cand.price_cents,
-                    count=cand.count,
-                    p_market=cand.p_market,
-                    p_model=cand.p_model,
-                    edge=cand.edge,
-                    reason=cand.reason,
+                    ticker=decision.ticker,
+                    side=decision.side,
+                    action=decision.action,
+                    price_cents=decision.price_cents,
+                    count=decision.count,
+                    p_market=decision.p_market,
+                    p_model=decision.p_model,
+                    edge=decision.edge,
+                    reason=decision.reason,
                 ))
                 session.commit()
                 decisions_rows.append({
                     "ts": now.isoformat(),
-                    **cand.__dict__,
+                    **decision.__dict__,
                 })
-                
-                log.info(
-                    f"Decision: {cand.ticker} {cand.side} @ {cand.price_cents}¢ "
-                    f"× {cand.count} (edge={cand.edge:.3f})"
-                )
 
-                # Execution
+                # Execute based on mode
                 filled = None
+                diagnostics["orders_attempted"] += 1
                 
                 if mode == "paper":
                     filled = paper.try_fill(
                         now=now,
-                        ticker=cand.ticker,
-                        side=cand.side,
-                        action=cand.action,
-                        price_cents=cand.price_cents,
-                        count=cand.count,
+                        ticker=decision.ticker,
+                        side=decision.side,
+                        action=decision.action,
+                        price_cents=decision.price_cents,
+                        count=decision.count,
                         yes_bids=yes,
                         no_bids=no,
-                        maker_only=settings.maker_only and not settings.enable_taker_test,
+                        maker_only=effective_maker_only,
                         est_fee_cents_per_contract=settings.est_taker_fee_cents_per_contract,
                     )
                     if filled:
-                        log.info(f"Paper fill: {filled.ticker} {filled.side} @ {filled.price_cents}¢")
+                        diagnostics["trades_filled"] += 1
                         session.add(Trade(
                             run_id=run_id, ts=filled.ts, ticker=filled.ticker, side=filled.side,
                             action=filled.action, price_cents=filled.price_cents, count=filled.count,
@@ -414,63 +356,80 @@ def run_loop(
                         cash_usd -= (filled.price_cents / 100.0) * filled.count
                         cash_usd -= (filled.fee_cents / 100.0)
                         total_expo = exposure_usd(pos)
-
+                
                 elif mode == "training":
-                    # Training mode: log "would trade" but don't execute
-                    log.info(
-                        f"Training mode - would trade: {cand.ticker} {cand.side} "
-                        f"@ {cand.price_cents}¢ × {cand.count}"
-                    )
-                    trades_rows.append({
-                        "ts": now.isoformat(),
-                        "ticker": cand.ticker,
-                        "side": cand.side,
-                        "action": cand.action,
-                        "price_cents": cand.price_cents,
-                        "count": cand.count,
-                        "fee_cents": 0,
-                        "mode": "training",
-                        "external_order_id": "would_trade",
-                    })
-
-                elif mode == "test":
-                    # Test mode: validate API but don't trade
-                    log.info(f"Test mode - validating API access for {cand.ticker}")
-                    # Could add portfolio/balance checks here
-                    
-                elif can_trade:  # demo or prod
-                    # Live trading
-                    assert live is not None
-                    log.info(f"Submitting live order: {cand.ticker} {cand.side} @ {cand.price_cents}¢")
-                    res = live.submit_limit_buy(
+                    # Training mode: log "would place" but don't actually trade
+                    result = training.would_place_order(
                         now=now,
-                        ticker=cand.ticker,
-                        side=cand.side,
-                        count=cand.count,
-                        price_cents=cand.price_cents
+                        ticker=decision.ticker,
+                        side=decision.side,
+                        action=decision.action,
+                        price_cents=decision.price_cents,
+                        count=decision.count,
+                        est_fee_cents_per_contract=settings.est_taker_fee_cents_per_contract,
                     )
+                    diagnostics["trades_filled"] += 1  # "would have" filled
+                    log.info("TRAINING: Would place order %s %s @ %d x%d",
+                            result.ticker, result.side, result.price_cents, result.count)
+                    
                     session.add(Trade(
-                        run_id=run_id, ts=res.ts, ticker=res.ticker, side=res.side,
-                        action=res.action, price_cents=res.price_cents, count=res.count,
-                        fee_cents=res.fee_cents, mode=mode, external_order_id=res.external_order_id
+                        run_id=run_id, ts=result.ts, ticker=result.ticker, side=result.side,
+                        action=result.action, price_cents=result.price_cents, count=result.count,
+                        fee_cents=result.fee_cents, mode="training", 
+                        external_order_id=result.external_order_id
                     ))
                     session.commit()
                     trades_rows.append({
-                        "ts": res.ts.isoformat(),
-                        "ticker": res.ticker,
-                        "side": res.side,
-                        "action": res.action,
-                        "price_cents": res.price_cents,
-                        "count": res.count,
-                        "fee_cents": res.fee_cents,
-                        "mode": mode,
-                        "external_order_id": res.external_order_id,
+                        "ts": result.ts.isoformat(),
+                        "ticker": result.ticker,
+                        "side": result.side,
+                        "action": result.action,
+                        "price_cents": result.price_cents,
+                        "count": result.count,
+                        "fee_cents": result.fee_cents,
+                        "mode": "training",
+                        "external_order_id": result.external_order_id,
                     })
-                    key = (res.ticker, res.side)
-                    pos[key] = apply_buy(pos.get(key, PositionState(0, 0.0)), res.price_cents, res.count)
+                    # For training, simulate position tracking
+                    key = (result.ticker, result.side)
+                    pos[key] = apply_buy(pos.get(key, PositionState(0, 0.0)), result.price_cents, result.count)
+                    cash_usd -= (result.price_cents / 100.0) * result.count
+                    cash_usd -= (result.fee_cents / 100.0)
                     total_expo = exposure_usd(pos)
 
-            # Equity snapshot
+                elif mode in {"demo", "prod", "test"}:
+                    # Live trading or test mode
+                    assert live is not None
+                    result = live.submit_limit_buy(
+                        now=now, 
+                        ticker=decision.ticker, 
+                        side=decision.side, 
+                        count=decision.count, 
+                        price_cents=decision.price_cents
+                    )
+                    diagnostics["trades_filled"] += 1
+                    session.add(Trade(
+                        run_id=run_id, ts=result.ts, ticker=result.ticker, side=result.side,
+                        action=result.action, price_cents=result.price_cents, count=result.count,
+                        fee_cents=result.fee_cents, mode=mode, external_order_id=result.external_order_id
+                    ))
+                    session.commit()
+                    trades_rows.append({
+                        "ts": result.ts.isoformat(),
+                        "ticker": result.ticker,
+                        "side": result.side,
+                        "action": result.action,
+                        "price_cents": result.price_cents,
+                        "count": result.count,
+                        "fee_cents": result.fee_cents,
+                        "mode": mode,
+                        "external_order_id": result.external_order_id,
+                    })
+                    key = (result.ticker, result.side)
+                    pos[key] = apply_buy(pos.get(key, PositionState(0, 0.0)), result.price_cents, result.count)
+                    total_expo = exposure_usd(pos)
+
+            # equity snapshot
             mtm = mark_to_market_usd(pos, mids_yes)
             equity_rows.append({
                 "ts": now.isoformat(),
@@ -482,12 +441,6 @@ def run_loop(
             })
 
             save_positions(session, pos, now)
-            
-            log.info(
-                f"Cycle complete: {decisions_this_cycle} decisions, "
-                f"{skips_this_cycle} skips, "
-                f"{len(trades_rows)} total trades"
-            )
 
             time.sleep(5)
 
@@ -495,21 +448,26 @@ def run_loop(
     write_csv(run_dir / "trades.csv", trades_rows)
     write_csv(run_dir / "equity.csv", equity_rows)
     write_csv(run_dir / "decisions.csv", decisions_rows)
-    write_csv(run_dir / "skips.csv", skip_rows)
+    write_csv(run_dir / "skips.csv", skips_rows)
 
-    # Diagnostics summary
-    diagnostics = {
-        "markets_scanned": total_markets_scanned,
-        "markets_with_orderbooks": total_markets_with_books,
-        "skip_reasons": dict(skip_reasons.most_common(10)),
-        "total_skips": sum(skip_reasons.values()),
-        "decisions_generated": len(decisions_rows),
-        "trades_executed": len([t for t in trades_rows if t.get("mode") != "training"]),
-        "training_would_trades": len([t for t in trades_rows if t.get("mode") == "training"]),
+    # Write diagnostics
+    diag_json = {
+        "markets_seen": diagnostics["markets_seen"],
+        "markets_with_orderbooks": diagnostics["markets_with_orderbooks"],
+        "decisions_generated": diagnostics["decisions_generated"],
+        "orders_attempted": diagnostics["orders_attempted"],
+        "trades_filled": diagnostics["trades_filled"],
+        "skip_reasons": dict(diagnostics["skip_reasons"]),
     }
-    write_json(run_dir / "diagnostics.json", diagnostics)
+    write_json(run_dir / "diagnostics.json", diag_json)
     
-    log.info(f"Diagnostics: {json.dumps(diagnostics, indent=2)}")
+    log.info("=== Run diagnostics ===")
+    log.info("Markets seen: %d", diagnostics["markets_seen"])
+    log.info("Markets with orderbooks: %d", diagnostics["markets_with_orderbooks"])
+    log.info("Decisions generated: %d", diagnostics["decisions_generated"])
+    log.info("Orders attempted: %d", diagnostics["orders_attempted"])
+    log.info("Trades filled: %d", diagnostics["trades_filled"])
+    log.info("Skip reasons: %s", dict(diagnostics["skip_reasons"].most_common(5)))
 
     # Prices at end of run
     try:
@@ -525,13 +483,13 @@ def run_loop(
     summary = {
         "run_id": run_id,
         "mode": mode,
-        "env": env,
+        "kalshi_env": settings.kalshi_env,
         "started_at": start.isoformat(),
         "ended_at": _utcnow().isoformat(),
         "minutes": minutes,
-        "trades": len([t for t in trades_rows if t.get("mode") != "training"]),
+        "trades": len(trades_rows),
         "decisions": len(decisions_rows),
-        "diagnostics": diagnostics,
+        "diagnostics": diag_json,
     }
     write_json(run_dir / "summary.json", summary)
     log.info("Run summary: %s", summary)

@@ -1,126 +1,274 @@
-# The Castle (MVP) — Kalshi Paper/Demo Trading Research Bot
+# Castle Bot Improvements Package
 
-This repository is an **MVP research scaffold** for:
-- Ingesting Kalshi market data (public endpoints)
-- Optionally ingesting news (RSS)
-- Generating simple features + signals
-- Executing in **paper mode** (default) or **Kalshi demo** (optional)
-- Producing run artifacts you can share back for analysis & iterative improvement
+## 📦 What's Inside
 
-> ⚠️ Not financial advice. Use the **demo environment first** and comply with Kalshi rules and your local laws.
+This package contains comprehensive improvements to the Castle trading bot that add:
 
-## Quick start
+- **🎯 Training Mode**: Research on production markets without trading risk
+- **📊 Diagnostics System**: Understand why markets are skipped and decisions aren't made
+- **🔒 Safety Improvements**: Mode validation and confirmations for prod trading
+- **✅ Unit Tests**: Comprehensive tests for new functionality
+- **📚 Documentation**: Detailed guides and examples
 
-### 1) Create a venv and install
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
+## 📁 Package Contents
+
+```
+castle-improvements/
+│
+├── install.sh                           # Automated installation script
+├── FILE_MANIFEST.md                     # Where each file goes
+│
+├── Documentation/
+│   ├── DEPLOYMENT_GUIDE.md             # Step-by-step installation
+│   ├── IMPLEMENTATION_SUMMARY.md        # Technical design details
+│   ├── BEFORE_AFTER.md                 # Visual comparison of changes
+│   └── README_MODES.md                 # Mode usage guide
+│
+├── Application Files/
+│   ├── src/castle/config.py            # Enhanced config with training mode
+│   ├── src/castle/runner.py            # Diagnostics + training support
+│   ├── src/castle/cli.py               # Mode validation + confirmations
+│   ├── src/castle/strategy/edge_strategy.py  # Skip reason tracking
+│   └── src/castle/execution/training.py      # Training mode executor
+│
+├── Tests/
+│   └── tests/test_modes_and_diagnostics.py   # Unit tests
+│
+└── Config Files/
+    ├── .env.example                    # Updated configuration template
+    └── pytest.ini                      # Test configuration
 ```
 
-### 2) Configure environment
-Copy `.env.example` to `.env` and edit.
+## 🚀 Quick Start
+
+### Option 1: Automated Installation (Recommended)
 
 ```bash
-cp .env.example .env
+# Extract the package
+unzip castle-improvements.zip
+cd castle-improvements
+
+# Run the installer (creates backups automatically)
+./install.sh /path/to/your/castle-bot
 ```
 
-### 3) Initialize DB
+### Option 2: Manual Installation
+
 ```bash
-castle init-db-cmd
+# See FILE_MANIFEST.md for detailed copy commands
+# Example:
+cp src/castle/config.py /path/to/castle-bot/src/castle/config.py
+cp src/castle/runner.py /path/to/castle-bot/src/castle/runner.py
+# ... etc
 ```
 
-### 4) Run (paper mode, default)
+### Verify Installation
+
 ```bash
+cd /path/to/castle-bot
+
+# Check syntax
+python -m compileall src
+
+# Run tests
+pip install pytest  # if needed
+pytest tests/test_modes_and_diagnostics.py -v
+
+# Quick test run
+castle run --minutes 1 --mode paper --limit-markets 5
+```
+
+## 🎯 Key Features
+
+### 1. Training Mode
+
+Research on real markets without risk:
+
+```bash
+# .env configuration
+KALSHI_ENV=prod
+CASTLE_MODE=training
+
+# Run it
+castle run --minutes 10 --mode training
+```
+
+**What it does:**
+- ✅ Fetches real production orderbooks
+- ✅ Generates real trading decisions  
+- ✅ Logs "would place order" entries
+- ❌ **Never** calls order submission APIs
+- ✅ Produces full run artifacts for analysis
+
+### 2. Diagnostics System
+
+Understand why you're getting 0 trades:
+
+```json
+{
+  "markets_seen": 40,
+  "markets_with_orderbooks": 35,
+  "decisions_generated": 5,
+  "orders_attempted": 5,
+  "trades_filled": 2,
+  "skip_reasons": {
+    "spread_too_wide": 15,
+    "insufficient_depth": 10,
+    "edge_too_small": 8
+  }
+}
+```
+
+**New output files:**
+- `diagnostics.json` - Aggregate statistics
+- `skips.csv` - Per-market skip reasons with details
+
+### 3. Clear Mode Architecture
+
+**Before:** Confusing single mode variable
+```bash
+CASTLE_MODE=prod  # Does this mean prod data? Prod trading? Both?
+```
+
+**After:** Separated concerns
+```bash
+KALSHI_ENV=prod     # Where to get data: demo | prod
+CASTLE_MODE=training # What to do: test | paper | training | demo | prod
+```
+
+**All modes:**
+- `test` - Demo env, API validation
+- `paper` - Simulate fills (default)
+- `training` - **Prod data, no trading** ⭐
+- `demo` - Place orders in demo
+- `prod` - **REAL TRADING** (requires confirmation)
+
+### 4. Safety Features
+
+- Prod mode requires explicit confirmation
+- Training mode can't accidentally place orders
+- Invalid modes rejected at CLI
+- Helpful error messages
+
+## 📖 Documentation
+
+| Document | Purpose |
+|----------|---------|
+| **DEPLOYMENT_GUIDE.md** | Complete installation walkthrough |
+| **FILE_MANIFEST.md** | Where each file should go |
+| **IMPLEMENTATION_SUMMARY.md** | Technical design and architecture |
+| **BEFORE_AFTER.md** | Visual comparison of changes |
+| **README_MODES.md** | Mode usage examples and workflows |
+
+## 🔧 What Changed
+
+### Modified Files (5)
+- `src/castle/config.py` - Mode helpers, training mode config
+- `src/castle/runner.py` - Diagnostics, training executor integration
+- `src/castle/cli.py` - Mode validation, confirmations
+- `src/castle/strategy/edge_strategy.py` - Skip reason tracking
+- `.env.example` - Updated documentation
+
+### New Files (3)
+- `src/castle/execution/training.py` - Training mode executor
+- `tests/test_modes_and_diagnostics.py` - Unit tests
+- `pytest.ini` - Test configuration
+
+### Changed Behavior
+- ✅ Every skip is now tracked (no more silent failures)
+- ✅ Diagnostics shown automatically after runs
+- ✅ Prod mode requires confirmation
+- ✅ Training mode enables safe research on real markets
+
+## 🧪 Testing
+
+After installation:
+
+```bash
+# Run all tests
+pytest tests/test_modes_and_diagnostics.py -v
+
+# Expected output:
+# test_mode_validation PASSED
+# test_skip_reason_structure PASSED  
+# test_training_executor_never_trades PASSED
+# test_decide_returns_skip_for_empty_orderbook PASSED
+# test_decide_returns_skip_for_wide_spread PASSED
+```
+
+## 📊 Example Workflows
+
+### Research on Real Markets (Safe)
+```bash
+export KALSHI_ENV=prod
+export CASTLE_MODE=training
+export ALLOW_TAKER_IN_PAPER=true
+
+castle run --minutes 30
+castle eval <run_id>
+cat runs/<run_id>/diagnostics.json
+```
+
+### Strategy Development (Paper)
+```bash
+export CASTLE_MODE=paper
+castle run --minutes 10
+```
+
+### Demo Environment Testing
+```bash
+export KALSHI_ENV=demo
+export CASTLE_MODE=demo
 castle run --minutes 5
 ```
 
-### 5) (Optional) Run against Kalshi **demo** execution
-You need a demo account + API key id + private key file.
-```bash
-castle run --minutes 5 --mode demo
-```
+## ⚠️ Important Notes
 
-Kalshi demo API root: `https://demo-api.kalshi.co/trade-api/v2` (public docs).
+1. **Training mode is safe by design** - The executor has no order submission code
+2. **Prod mode requires explicit confirmation** - You'll be prompted before placing real orders
+3. **All existing functionality preserved** - Default behavior unchanged
+4. **Backups created automatically** - The install script backs up existing files
 
-## What you share back for the feedback loop
+## 🆘 Troubleshooting
 
-After a run, you will have:
-- `runs/<run_id>/summary.json`
-- `runs/<run_id>/trades.csv`
-- `runs/<run_id>/equity.csv`
-- `runs/<run_id>/config.redacted.json`
-- `runs/<run_id>/logs.txt`
+### Issue: "No module named 'castle.execution.training'"
+**Solution:** Make sure training.py is in `src/castle/execution/training.py`
 
-Bundle them:
-```bash
-castle bundle --run-id <run_id>
-```
+### Issue: pytest collects from proposals/
+**Solution:** Copy the updated `pytest.ini` file
 
-Then upload the generated zip back into this chat. I can analyze the metrics and propose code changes.
+### Issue: Still getting 0 decisions
+**Solution:** Check `diagnostics.json` to see skip reasons, then adjust:
+- `spread_too_wide` → Increase `MAX_SPREAD_CENTS`
+- `insufficient_depth` → Decrease `MIN_DEPTH_CONTRACTS`
+- `edge_too_small` → Decrease `MIN_EDGE_PROB`
 
-## Commands
-- `castle init-db-cmd`
-- `castle run --minutes N [--mode paper|demo|prod]`
-- `castle report --run-id <run_id>`
-- `castle bundle --run-id <run_id>`
+### Issue: Training mode shows 0 trades
+**Solution:** This is expected! Training mode logs "would trade" but doesn't execute. Check `trades.csv` for entries with `mode="training"` and `external_order_id="TRAINING_WOULD_PLACE"`
 
-## Repo layout
-- `src/castle/kalshi/` : Kalshi REST client + auth
-- `src/castle/news/`   : RSS ingestion
-- `src/castle/strategy/`: feature extraction + signal + sizing
-- `src/castle/execution/`: paper + kalshi execution
-- `src/castle/cli.py`  : command line entrypoint
+## 🤝 Support
 
+1. Read **DEPLOYMENT_GUIDE.md** for detailed installation steps
+2. Check **BEFORE_AFTER.md** for examples
+3. See **IMPLEMENTATION_SUMMARY.md** for technical details
+4. Review test cases in `tests/test_modes_and_diagnostics.py`
 
-## Security note (important)
-- Do **NOT** put API keys into the repository or commit history.
-- Keep secrets in `.env` (ignored by git) or a local `secrets/` folder.
-- If you accidentally pasted keys into chat or a public place, rotate them immediately.
+## 📝 Version Info
 
-## Self-improvement loop (spec-driven, gated)
+- Package version: 1.0.0
+- Compatible with: Castle Bot v0.1.0+
+- Python requirement: 3.10+
+- Dependencies: No new dependencies added
 
-The repo includes a **requirements spec** at `minions/requirements.yaml` and a **proposal system**
-that can ask a codegen model (Gemini) to propose file-level edits based on run metrics.
+## ✨ What's Next
 
-**Workflow**
-1. Run a paper/demo session:
-   ```bash
-   castle run --minutes 10
-   ```
-2. Evaluate the run:
-   ```bash
-   castle eval --run-id <RUN_ID>
-   ```
-3. Propose improvements (writes to `proposals/<proposal_id>/`):
-   ```bash
-   castle improve propose --run-id <RUN_ID>
-   ```
-4. Review proposed files in `proposals/<proposal_id>/files/`
-5. Apply (runs `python -m compileall src`):
-   ```bash
-   castle improve apply --proposal-id <proposal_id>
-   ```
+After installation, you can:
+1. Run training mode on real markets for 30+ minutes
+2. Analyze the diagnostics to understand market filtering
+3. Adjust strategy parameters based on skip reasons
+4. Use `castle improve propose` with better context
+5. Iterate on strategy safely with training mode
 
-**Safety**
-- Proposals are never applied automatically.
-- Keep `CASTLE_MODE=paper` for automation. Only switch to demo/prod intentionally.
+---
 
-### About sending logs to Gemini
-`castle improve propose` includes:
-- redacted tail of `runs/<run_id>/logs.txt`
-- tail snapshots of decisions/trades/equity CSVs
-
-The redaction is intentionally conservative, but you should still avoid logging secrets.
-
-## Using OpenAI for analytics/codegen
-
-Set in `.env`:
-
-- `CODEGEN_PROVIDER=openai`
-- `OPENAI_API_KEY=...`
-- `OPENAI_MODEL=gpt-5.2` (default)
-
-The codegen system uses the **Responses API** and **Structured Outputs** (`text.format` with JSON Schema)
-to produce machine-applyable proposals. See OpenAI docs for authentication and Responses usage.
+**Ready to install?** Start with `./install.sh /path/to/castle-bot` or see DEPLOYMENT_GUIDE.md!

@@ -1,3 +1,6 @@
+# PATCH for src/castle/config.py
+# This adds training mode and clarifies mode/env separation
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -41,14 +44,19 @@ class Settings:
     runs_dir: Path
     log_level: str
 
-    # Kalshi
-    kalshi_env: str
+    # Kalshi environment (where to get data from)
+    kalshi_env: str  # demo | prod
     kalshi_key_id: str
     kalshi_private_key_path: Path | None
     kalshi_demo_root: str
     kalshi_prod_root: str
 
-    # Mode
+    # Execution mode (what to do with data)
+    # test = demo env, API validation only
+    # paper = simulate fills (any env)
+    # training = prod data, no trading, "would trade" logs
+    # demo = place orders in demo env
+    # prod = place orders in prod env
     mode: str
 
     # Strategy / Risk
@@ -60,10 +68,9 @@ class Settings:
     min_depth_contracts: int
     maker_only: bool
     est_taker_fee_cents_per_contract: int
-    
-    # Strategy enhancements
-    decision_cooldown_seconds: int
-    enable_taker_test: bool  # For paper/training: test taker logic even if maker_only=true
+
+    # Paper/training mode testing
+    allow_taker_in_paper: bool  # for end-to-end testing
 
     # News (RSS)
     news_feeds: List[str]
@@ -84,6 +91,20 @@ class Settings:
     openai_api_key: str
     openai_model: str
     openai_base_url: str
+
+    def get_kalshi_root(self) -> str:
+        """Get the appropriate Kalshi API root based on kalshi_env."""
+        if self.kalshi_env == "prod":
+            return self.kalshi_prod_root
+        return self.kalshi_demo_root
+
+    def is_trading_mode(self) -> bool:
+        """Returns True if this mode actually places orders."""
+        return self.mode in {"demo", "prod"}
+
+    def is_safe_mode(self) -> bool:
+        """Returns True if no real orders will be placed."""
+        return self.mode in {"test", "paper", "training"}
 
 def get_settings() -> Settings:
     # Kalshi env vars: accept both naming conventions.
@@ -117,8 +138,7 @@ def get_settings() -> Settings:
         maker_only=_bool("MAKER_ONLY", True),
         est_taker_fee_cents_per_contract=_int("EST_TAKER_FEE_CENTS_PER_CONTRACT", 2),
         
-        decision_cooldown_seconds=_int("DECISION_COOLDOWN_SECONDS", 60),
-        enable_taker_test=_bool("ENABLE_TAKER_TEST", False),
+        allow_taker_in_paper=_bool("ALLOW_TAKER_IN_PAPER", False),
 
         news_feeds=_list_csv("NEWS_FEEDS"),
         news_lookback_hours=_int("NEWS_LOOKBACK_HOURS", 24),

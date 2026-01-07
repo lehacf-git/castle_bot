@@ -1,3 +1,6 @@
+# PATCH for src/castle/strategy/edge_strategy.py
+# Adds skip_reason tracking for diagnostics
+
 from __future__ import annotations
 
 import datetime as dt
@@ -21,10 +24,10 @@ class DecisionCandidate:
 
 @dataclass(frozen=True)
 class SkipReason:
-    """Track why a market was skipped"""
+    """Tracks why a market was skipped (for diagnostics)."""
     ticker: str
     reason: str
-    details: dict
+    detail: str = ""
 
 def decide(
     *,
@@ -43,61 +46,36 @@ def decide(
     current_total_exposure_usd: float,
     maker_only: bool,
     est_taker_fee_cents_per_contract: int,
-    enable_taker_test: bool = False,
 ) -> tuple[Optional[DecisionCandidate], Optional[SkipReason]]:
     """
-    Returns (candidate, skip_reason).
+    Returns (decision, skip_reason).
     Exactly one will be non-None.
     """
     
     bp = best_prices(yes_bids, no_bids)
     
-    # Check 1: Valid prices
+    # Check if we have valid best prices
     if bp.best_yes_bid is None or bp.best_yes_ask is None:
-        return None, SkipReason(
-            ticker=ticker,
-            reason="no_prices",
-            details={"yes_bid": bp.best_yes_bid, "yes_ask": bp.best_yes_ask}
-        )
+        return None, SkipReason(ticker, "no_prices", "missing best_yes_bid or best_yes_ask")
     
     sp = spread_cents(bp.best_yes_bid, bp.best_yes_ask)
     if sp is None:
-        return None, SkipReason(
-            ticker=ticker,
-            reason="invalid_spread",
-            details={"spread": sp}
-        )
+        return None, SkipReason(ticker, "no_spread", "could not compute spread")
     
-    # Check 2: Spread filter
     if sp > max_spread_cents:
-        return None, SkipReason(
-            ticker=ticker,
-            reason="spread_too_wide",
-            details={"spread": sp, "max_allowed": max_spread_cents}
-        )
+        return None, SkipReason(ticker, "spread_too_wide", f"spread={sp} > {max_spread_cents}")
 
-    # Check 3: Depth filter
     yes_depth, no_depth = depth_within(yes_bids, no_bids, depth_cents=5)
-    max_depth = max(yes_depth, no_depth)
-    if max_depth < min_depth_contracts:
+    if max(yes_depth, no_depth) < min_depth_contracts:
         return None, SkipReason(
-            ticker=ticker,
-            reason="insufficient_depth",
-            details={
-                "yes_depth": yes_depth,
-                "no_depth": no_depth,
-                "max_depth": max_depth,
-                "min_required": min_depth_contracts
-            }
+            ticker, 
+            "insufficient_depth", 
+            f"max_depth={max(yes_depth, no_depth)} < {min_depth_contracts}"
         )
 
     pm = mid_prob(bp.best_yes_bid, bp.best_yes_ask)
     if pm is None:
-        return None, SkipReason(
-            ticker=ticker,
-            reason="no_mid_price",
-            details={}
-        )
+        return None, SkipReason(ticker, "no_mid_prob", "could not compute mid probability")
 
     # News -> small tilt around market mid.
     ns = aggregate_news_signal(title, news_headlines, now, lookback_hours=24)
@@ -107,36 +85,22 @@ def decide(
 
     # Choose side based on p_model vs p_market
     edge = p_model - pm
-    
-    # Check 4: Edge threshold
     if abs(edge) < min_edge_prob:
         return None, SkipReason(
-            ticker=ticker,
-            reason="insufficient_edge",
-            details={
-                "edge": edge,
-                "abs_edge": abs(edge),
-                "min_required": min_edge_prob,
-                "p_model": p_model,
-                "p_market": pm
-            }
+            ticker, 
+            "edge_too_small", 
+            f"edge={edge:.4f} < {min_edge_prob}"
         )
 
     # Fee cushion (very rough): require extra edge if taking.
+    # In cents, fee drag for taker effectively reduces expected value. We'll map cents to prob.
     fee_prob = est_taker_fee_cents_per_contract / 100.0
-    effective_maker_only = maker_only and not enable_taker_test
-    
-    if not effective_maker_only:
+    if not maker_only:
         if abs(edge) < (min_edge_prob + fee_prob):
             return None, SkipReason(
-                ticker=ticker,
-                reason="insufficient_edge_after_fees",
-                details={
-                    "edge": edge,
-                    "min_edge": min_edge_prob,
-                    "fee_prob": fee_prob,
-                    "required_edge": min_edge_prob + fee_prob
-                }
+                ticker, 
+                "edge_insufficient_for_fees", 
+                f"edge={edge:.4f} < {min_edge_prob + fee_prob:.4f}"
             )
 
     side = "yes" if edge > 0 else "no"
@@ -144,62 +108,39 @@ def decide(
     # Price selection:
     # Maker-only => bid at best bid for that side.
     # Otherwise => cross implied ask (taker) for stronger edge.
-    if effective_maker_only:
+    if maker_only:
         if side == "yes":
             if bp.best_yes_bid is None:
-                return None, SkipReason(
-                    ticker=ticker,
-                    reason="no_yes_bid_for_maker",
-                    details={"side": side}
-                )
+                return None, SkipReason(ticker, "no_yes_bid", "maker mode needs yes bid")
             price = bp.best_yes_bid
         else:
             if bp.best_no_bid is None:
-                return None, SkipReason(
-                    ticker=ticker,
-                    reason="no_no_bid_for_maker",
-                    details={"side": side}
-                )
+                return None, SkipReason(ticker, "no_no_bid", "maker mode needs no bid")
             price = bp.best_no_bid
     else:
         if side == "yes":
             if bp.best_yes_ask is None:
-                return None, SkipReason(
-                    ticker=ticker,
-                    reason="no_yes_ask_for_taker",
-                    details={"side": side}
-                )
+                return None, SkipReason(ticker, "no_yes_ask", "taker mode needs yes ask")
             price = bp.best_yes_ask
         else:
+            # buying NO crosses NO ask, which is implied from YES bid
             if bp.best_no_ask is None:
-                return None, SkipReason(
-                    ticker=ticker,
-                    reason="no_no_ask_for_taker",
-                    details={"side": side}
-                )
+                return None, SkipReason(ticker, "no_no_ask", "taker mode needs no ask")
             price = bp.best_no_ask
 
-    # Check 5: Exposure limits
+    # Bet sizing: simple capped fractional-kelly-ish based on edge magnitude.
     max_risk = min(max_risk_per_market_usd, max(0.0, max_total_exposure_usd - current_total_exposure_usd))
     if max_risk <= 0:
         return None, SkipReason(
-            ticker=ticker,
-            reason="exposure_limit_reached",
-            details={
-                "current_exposure": current_total_exposure_usd,
-                "max_total": max_total_exposure_usd,
-                "max_per_market": max_risk_per_market_usd
-            }
+            ticker, 
+            "max_exposure_reached", 
+            f"current={current_total_exposure_usd:.2f} >= {max_total_exposure_usd}"
         )
 
     # worst-case risk for buying: price_cents per contract (USD = cents/100)
     cost_per_contract = price / 100.0
     if cost_per_contract <= 0:
-        return None, SkipReason(
-            ticker=ticker,
-            reason="invalid_cost_per_contract",
-            details={"price": price, "cost": cost_per_contract}
-        )
+        return None, SkipReason(ticker, "invalid_price", f"price={price}")
 
     # base size proportional to |edge|; cap to max_risk.
     target_usd = max_risk * min(1.0, abs(edge) / 0.10)  # full size at 10pp edge
@@ -208,7 +149,7 @@ def decide(
 
     reason = f"pm={pm:.3f} model={p_model:.3f} edge={edge:.3f} spread={sp} ns=({ns.score:.2f},{ns.weight:.2f}) {ns.reason}"
 
-    candidate = DecisionCandidate(
+    decision = DecisionCandidate(
         ticker=ticker,
         side=side,
         action="buy",
@@ -220,4 +161,4 @@ def decide(
         reason=reason,
     )
     
-    return candidate, None
+    return decision, None

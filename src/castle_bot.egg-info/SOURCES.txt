@@ -40,4 +40,5 @@ src/castle_bot.egg-info/dependency_links.txt
 src/castle_bot.egg-info/entry_points.txt
 src/castle_bot.egg-info/requires.txt
 src/castle_bot.egg-info/top_level.txt
+tests/test_modes.py
 tests/test_orderbook_math.py
