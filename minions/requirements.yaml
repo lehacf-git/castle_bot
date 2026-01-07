@@ -1,0 +1,71 @@
+version: 1
+goal:
+  description: >
+    Improve research performance (paper/demo) by iterating on data ingestion, feature engineering,
+    probability estimation, and risk management. Do not assume you can "beat the market"; treat it
+    as an empirical optimization problem with measured metrics and strong safety limits.
+constraints:
+  - Never hardcode secrets into the repo.
+  - Default mode is paper.
+  - Any live/demo trading must pass risk checks and be explicitly enabled.
+minions:
+  - name: market_data
+    responsibilities:
+      - Ingest open markets list
+      - Ingest orderbook snapshots
+      - Normalize data into DB + raw json snapshots
+    interfaces:
+      inputs: []
+      outputs: [markets, orderbooks]
+    quality_bars:
+      - Respects rate limits and retries safely
+      - Handles missing/partial orderbooks
+  - name: news_ingest
+    responsibilities:
+      - Ingest RSS feeds (optional)
+      - Ingest NewsAPI.org query (optional)
+    interfaces:
+      inputs: [NEWS_FEEDS, NEWS_API_KEY, NEWSAPI_QUERY]
+      outputs: [news_items]
+    quality_bars:
+      - Dedupes by URL
+      - Stores timestamps in UTC
+  - name: strategy
+    responsibilities:
+      - Produce probability estimate p_model per market
+      - Compute edge vs p_market and decide if trade is warranted
+      - Provide an interpretable reason string for each decision
+    interfaces:
+      inputs: [orderbook_snapshots, news_items]
+      outputs: [decisions]
+    quality_bars:
+      - Fee-aware thresholds
+      - Filters illiquid/wide markets
+  - name: execution
+    responsibilities:
+      - Paper mode fill simulation (conservative)
+      - Demo/prod order submission (limit buys)
+    interfaces:
+      inputs: [decisions]
+      outputs: [trades, positions]
+    quality_bars:
+      - Enforces risk constraints
+      - Avoids runaway order loops
+  - name: evaluation
+    responsibilities:
+      - Compute metrics from run artifacts (P&L proxy, drawdown proxy, turnover)
+      - Generate improvement prompts for codegen assistant
+    interfaces:
+      inputs: [runs/<run_id> artifacts]
+      outputs: [metrics.json, improvement_prompt.txt]
+  - name: codegen
+    provider: openai_or_gemini
+    responsibilities:
+      - Propose changes to requirements and/or code as a set of file edits
+      - Never apply changes without explicit approval
+    interfaces:
+      inputs: [requirements.yaml, metrics.json]
+      outputs: [proposal bundle]
+    quality_bars:
+      - Produces minimal, testable diffs
+      - Adds/updates tests when changing behavior

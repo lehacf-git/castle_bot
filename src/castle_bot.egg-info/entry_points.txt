@@ -1,0 +1,2 @@
+[console_scripts]
+castle = castle.cli:app
