@@ -158,7 +158,11 @@ def ingest_markets_and_orderbooks(
                 continue
             
             # Liquidity score: 70% volume, 30% open interest
-            liquidity_score = (volume_24h * 0.7) + (open_interest * 0.3)
+            # If volume is 0 everywhere, use 100% open interest
+            if volume_24h == 0 and open_interest > 0:
+                liquidity_score = float(open_interest)
+            else:
+                liquidity_score = (volume_24h * 0.7) + (open_interest * 0.3)
             
             scored_markets.append({
                 'market': m,
@@ -196,16 +200,17 @@ def ingest_markets_and_orderbooks(
         # Log top 10 markets
         log.info(f"=== Top 10 Markets by Liquidity ===")
         for i, m in enumerate(top_markets[:10], 1):
+            title = m['market'].get('title', '')[:60]  # First 60 chars
             log.info(
-                f"{i:2d}. {m['ticker']:20s} "
+                f"{i:2d}. {m['ticker']:45s} "
                 f"vol={m['volume_24h']:6d} "
                 f"oi={m['open_interest']:6d} "
                 f"score={m['liquidity_score']:8.0f}"
             )
+            if title:
+                log.info(f"    {title}")
     
-    diagnostics.markets_fetched = len(top_markets)  # Track selected count
-    
-    diagnostics.markets_fetched = len(top_markets)  # Track selected count
+    diagnostics.markets_fetched = len(all_markets)  # Track total fetched
     
     # Now process the top markets: store metadata and fetch orderbooks
     out = []
