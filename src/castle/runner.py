@@ -92,24 +92,44 @@ def ingest_markets_and_orderbooks(
     kc: KalshiClient, 
     now: dt.datetime, 
     limit_markets: int = 50,
+    min_volume_24h: int = 100,
+    min_open_interest: int = 50,
     diagnostics: RunDiagnostics | None = None
 ) -> list[tuple[str, str, list, list]]:
     """
-    Ingest markets with pagination support and improved diagnostics.
+    Ingest markets with pagination support, volume filtering, and improved diagnostics.
     
-    Returns list of (ticker, title, yes_bids, no_bids) for markets with orderbooks.
+    Fetches markets, ranks by liquidity (volume + open interest), and selects top N.
+    
+    Args:
+        session: Database session
+        kc: Kalshi API client
+        now: Current timestamp
+        limit_markets: Number of markets to select (after filtering)
+        min_volume_24h: Minimum 24h volume to consider
+        min_open_interest: Minimum open interest to consider
+        diagnostics: Diagnostic tracker
+    
+    Returns:
+        List of (ticker, title, yes_bids, no_bids) for markets with orderbooks.
     """
     if diagnostics is None:
         diagnostics = RunDiagnostics()
+    
+    # Fetch MORE markets than we need, so we can filter and select top by volume
+    # Fetch 3-5x the target to ensure we get enough liquid markets
+    fetch_limit = limit_markets * 4
+    
+    log.info(f"Fetching up to {fetch_limit} markets to select top {limit_markets} by liquidity")
     
     # Grab open markets with pagination
     all_markets = []
     cursor = None
     
-    # Fetch up to limit_markets total, using pagination if needed
-    while len(all_markets) < limit_markets:
+    while len(all_markets) < fetch_limit:
         try:
-            resp = kc.list_markets(status="open", limit=min(100, limit_markets - len(all_markets)), cursor=cursor)
+            batch_size = min(200, fetch_limit - len(all_markets))  # Max 200 per request
+            resp = kc.list_markets(status="open", limit=batch_size, cursor=cursor)
             markets = resp.get("markets") or []
             if not markets:
                 break
@@ -123,11 +143,74 @@ def ingest_markets_and_orderbooks(
             log.warning("Failed to fetch markets page: %s", e)
             break
     
-    log.info(f"Fetched {len(all_markets)} markets (limit: {limit_markets})")
-    diagnostics.markets_fetched = len(all_markets)
+    log.info(f"Fetched {len(all_markets)} total open markets")
     
-    out = []
+    # Score and rank by liquidity (volume + open interest)
+    scored_markets = []
     for m in all_markets:
+        try:
+            ticker = m.get('ticker', '')
+            volume_24h = int(m.get('volume_24h', 0) or 0)
+            open_interest = int(m.get('open_interest', 0) or 0)
+            
+            # Skip markets below minimum thresholds
+            if volume_24h < min_volume_24h and open_interest < min_open_interest:
+                continue
+            
+            # Liquidity score: 70% volume, 30% open interest
+            liquidity_score = (volume_24h * 0.7) + (open_interest * 0.3)
+            
+            scored_markets.append({
+                'market': m,
+                'ticker': ticker,
+                'volume_24h': volume_24h,
+                'open_interest': open_interest,
+                'liquidity_score': liquidity_score
+            })
+        except Exception as e:
+            log.warning(f"Failed to score market {m.get('ticker')}: {e}")
+            continue
+    
+    # Sort by liquidity score (highest first)
+    scored_markets.sort(key=lambda x: x['liquidity_score'], reverse=True)
+    
+    # Take top N
+    top_markets = scored_markets[:limit_markets]
+    
+    # Log selection summary
+    if top_markets:
+        total_vol = sum(m['volume_24h'] for m in top_markets)
+        total_oi = sum(m['open_interest'] for m in top_markets)
+        avg_vol = total_vol / len(top_markets)
+        avg_oi = total_oi / len(top_markets)
+        
+        log.info(f"=== Market Selection Summary ===")
+        log.info(f"Total markets fetched: {len(all_markets)}")
+        log.info(f"Markets after filtering: {len(scored_markets)}")
+        log.info(f"Top markets selected: {len(top_markets)}")
+        log.info(f"Total 24h volume: {total_vol:,}")
+        log.info(f"Total open interest: {total_oi:,}")
+        log.info(f"Avg 24h volume: {avg_vol:.0f}")
+        log.info(f"Avg open interest: {avg_oi:.0f}")
+        
+        # Log top 10 markets
+        log.info(f"=== Top 10 Markets by Liquidity ===")
+        for i, m in enumerate(top_markets[:10], 1):
+            log.info(
+                f"{i:2d}. {m['ticker']:20s} "
+                f"vol={m['volume_24h']:6d} "
+                f"oi={m['open_interest']:6d} "
+                f"score={m['liquidity_score']:8.0f}"
+            )
+    
+    diagnostics.markets_fetched = len(top_markets)  # Track selected count
+    
+    diagnostics.markets_fetched = len(top_markets)  # Track selected count
+    
+    # Now process the top markets: store metadata and fetch orderbooks
+    out = []
+    for scored in top_markets:
+        m = scored['market']
         ticker = m.get("ticker")
         title = m.get("title") or ""
         status = m.get("status") or ""
@@ -206,7 +289,16 @@ def exposure_usd(pos: dict[tuple[str, str], PositionState]) -> float:
         cents += p.qty * p.avg_price_cents
     return cents / 100.0
 
-def run_loop(*, engine, settings: Settings, minutes: int, mode: str, limit_markets: int = 40) -> Path:
+def run_loop(
+    *, 
+    engine, 
+    settings: Settings, 
+    minutes: int, 
+    mode: str, 
+    limit_markets: int = 40,
+    min_volume_24h: int = 100,
+    min_open_interest: int = 50
+) -> Path:
     """
     Main trading loop with enhanced diagnostics and training mode support.
     
@@ -284,7 +376,13 @@ def run_loop(*, engine, settings: Settings, minutes: int, mode: str, limit_marke
             news = load_recent_news(session, now, settings.news_lookback_hours)
 
             # Ingest markets with diagnostics
-            md = ingest_markets_and_orderbooks(session, kc, now, limit_markets=limit_markets, diagnostics=diagnostics)
+            md = ingest_markets_and_orderbooks(
+                session, kc, now, 
+                limit_markets=limit_markets,
+                min_volume_24h=min_volume_24h,
+                min_open_interest=min_open_interest,
+                diagnostics=diagnostics
+            )
 
             # Compute mids for MTM
             mids_yes = {}

@@ -1,3 +1,6 @@
+# PATCH for src/castle/config.py
+# This adds training mode and clarifies mode/env separation
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -41,14 +44,19 @@ class Settings:
     runs_dir: Path
     log_level: str
 
-    # Kalshi
-    kalshi_env: str
+    # Kalshi environment (where to get data from)
+    kalshi_env: str  # demo | prod
     kalshi_key_id: str
     kalshi_private_key_path: Path | None
     kalshi_demo_root: str
     kalshi_prod_root: str
 
-    # Mode
+    # Execution mode (what to do with data)
+    # test = demo env, API validation only
+    # paper = simulate fills (any env)
+    # training = prod data, no trading, "would trade" logs
+    # demo = place orders in demo env
+    # prod = place orders in prod env
     mode: str
 
     # Strategy / Risk
@@ -60,9 +68,9 @@ class Settings:
     min_depth_contracts: int
     maker_only: bool
     est_taker_fee_cents_per_contract: int
-    
-    # Testing flags
-    enable_taker_test: bool  # For paper/training: test taker logic even if maker_only=true
+
+    # Paper/training mode testing
+    allow_taker_in_paper: bool  # for end-to-end testing
 
     # News (RSS)
     news_feeds: List[str]
@@ -84,39 +92,31 @@ class Settings:
     openai_model: str
     openai_base_url: str
 
-    def validate_mode(self) -> None:
-        """Validate mode settings for safety."""
-        valid_modes = {"test", "paper", "training", "demo", "prod"}
-        if self.mode not in valid_modes:
-            raise ValueError(f"Invalid mode: {self.mode}. Must be one of {valid_modes}")
-        
-        # Safety checks
-        if self.mode in {"demo", "prod"}:
-            if not self.kalshi_key_id or not self.kalshi_private_key_path:
-                raise ValueError(f"Mode '{self.mode}' requires KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PATH")
-        
-        if self.mode == "training" and self.kalshi_env != "prod":
-            raise ValueError("Training mode requires KALSHI_ENV=prod (uses prod data without trading)")
-        
-        if self.mode == "test" and self.kalshi_env != "demo":
-            raise ValueError("Test mode requires KALSHI_ENV=demo (validates API in demo environment)")
-
     def get_kalshi_root(self) -> str:
         """Get the appropriate Kalshi API root based on kalshi_env."""
         if self.kalshi_env == "prod":
             return self.kalshi_prod_root
         return self.kalshi_demo_root
 
-    def should_execute_trades(self) -> bool:
-        """Return True only if this mode should place real orders."""
+    def is_trading_mode(self) -> bool:
+        """Returns True if this mode actually places orders."""
         return self.mode in {"demo", "prod"}
+
+    def is_safe_mode(self) -> bool:
+        """Returns True if no real orders will be placed."""
+        return self.mode in {"test", "paper", "training"}
 
 def get_settings() -> Settings:
     # Kalshi env vars: accept both naming conventions.
+    # Preferred:
+    # - KALSHI_API_KEY_ID
+    # - KALSHI_PRIVATE_KEY_PATH
+    # Back-compat:
+    # - KALSHI_KEY_ID
     key_id = _str("KALSHI_API_KEY_ID", "").strip() or _str("KALSHI_KEY_ID", "").strip()
     pk = _str("KALSHI_PRIVATE_KEY_PATH", "").strip()
 
-    settings = Settings(
+    return Settings(
         db_url=_str("CASTLE_DB_URL", "sqlite:///castle.db"),
         runs_dir=Path(_str("CASTLE_RUNS_DIR", "./runs")).expanduser(),
         log_level=_str("CASTLE_LOG_LEVEL", "INFO"),
@@ -138,7 +138,7 @@ def get_settings() -> Settings:
         maker_only=_bool("MAKER_ONLY", True),
         est_taker_fee_cents_per_contract=_int("EST_TAKER_FEE_CENTS_PER_CONTRACT", 2),
         
-        enable_taker_test=_bool("ENABLE_TAKER_TEST", False),
+        allow_taker_in_paper=_bool("ALLOW_TAKER_IN_PAPER", False),
 
         news_feeds=_list_csv("NEWS_FEEDS"),
         news_lookback_hours=_int("NEWS_LOOKBACK_HOURS", 24),
@@ -156,8 +156,3 @@ def get_settings() -> Settings:
         openai_model=_str("OPENAI_MODEL", "gpt-5.2").strip(),
         openai_base_url=_str("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/"),
     )
-    
-    # Validate on creation
-    settings.validate_mode()
-    
-    return settings
