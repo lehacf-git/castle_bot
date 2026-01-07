@@ -15,7 +15,7 @@ import logging
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
@@ -264,7 +264,7 @@ def run_loop(*, engine, settings: Settings, minutes: int, mode: str, limit_marke
     trades_rows = []
     equity_rows = []
     decisions_rows = []
-    skip_reasons = {}  # Track why markets were skipped
+    skip_reasons_count: Dict[str, int] = {}  # Track why markets were skipped
     
     start = _utcnow()
     end = start + dt.timedelta(minutes=minutes)
@@ -303,7 +303,8 @@ def run_loop(*, engine, settings: Settings, minutes: int, mode: str, limit_marke
             decisions_this_cycle = 0
             
             for ticker, title, yes, no in md:
-                cand = decide(
+                # Call decide() and handle different return types
+                result = decide(
                     ticker=ticker,
                     title=title,
                     yes_bids=yes,
@@ -321,8 +322,34 @@ def run_loop(*, engine, settings: Settings, minutes: int, mode: str, limit_marke
                     est_taker_fee_cents_per_contract=settings.est_taker_fee_cents_per_contract,
                 )
                 
-                if not cand:
-                    # Track skip reason (would need to modify decide() to return reason)
+                # Handle different return types from decide()
+                # Could be: None, DecisionCandidate, or (DecisionCandidate, SkipReason) tuple
+                cand = None
+                skip_reason = None
+                
+                if result is None:
+                    # No decision, no skip reason
+                    continue
+                elif isinstance(result, tuple):
+                    # New format: (candidate, skip_reason)
+                    cand, skip_reason = result
+                    if skip_reason is not None:
+                        reason_key = getattr(skip_reason, 'reason', 'unknown')
+                        skip_reasons_count[reason_key] = skip_reasons_count.get(reason_key, 0) + 1
+                        log.debug(f"Skipped {ticker}: {reason_key}")
+                    if cand is None:
+                        continue
+                else:
+                    # Old format: just the candidate
+                    cand = result
+                
+                # At this point, cand should be a valid DecisionCandidate
+                if cand is None:
+                    continue
+                
+                # Verify cand has the expected attributes
+                if not hasattr(cand, 'ticker'):
+                    log.warning(f"Invalid candidate object: {type(cand)}")
                     continue
                 
                 decisions_this_cycle += 1
@@ -480,10 +507,20 @@ def run_loop(*, engine, settings: Settings, minutes: int, mode: str, limit_marke
             
             time.sleep(5)
     
+    # Log skip reasons summary
+    if skip_reasons_count:
+        log.info("Skip reasons summary:")
+        for reason, count in sorted(skip_reasons_count.items(), key=lambda x: -x[1]):
+            log.info(f"  {reason}: {count}")
+    
     # Write artifacts
     write_csv(run_dir / "trades.csv", trades_rows)
     write_csv(run_dir / "equity.csv", equity_rows)
     write_csv(run_dir / "decisions.csv", decisions_rows)
+    
+    # Write skip reasons
+    if skip_reasons_count:
+        write_json(run_dir / "skip_reasons.json", skip_reasons_count)
     
     # Write end prices
     try:
@@ -510,6 +547,8 @@ def run_loop(*, engine, settings: Settings, minutes: int, mode: str, limit_marke
         "minutes": minutes,
         "trades": len(trades_rows),
         "decisions": len(decisions_rows),
+        "markets_scanned": len(md) if 'md' in dir() else 0,
+        "skip_reasons": skip_reasons_count,
     }
     write_json(run_dir / "summary.json", summary)
     log.info("Run summary: %s", summary)
