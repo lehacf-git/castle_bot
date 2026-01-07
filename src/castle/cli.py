@@ -123,7 +123,10 @@ def report(run_id: str = typer.Argument(..., help="Run id folder name under runs
         if diag:
             table.add_row("Markets scanned", str(diag.get("markets_scanned", 0)))
             table.add_row("Markets with books", str(diag.get("markets_with_orderbooks", 0)))
-            table.add_row("Skip reasons (top 3)", str(diag.get("top_skip_reasons", [])))
+            skip_reasons = diag.get("skip_reasons", {})
+            if skip_reasons:
+                top_3 = sorted(skip_reasons.items(), key=lambda x: x[1], reverse=True)[:3]
+                table.add_row("Skip reasons (top 3)", str([f"{k}:{v}" for k, v in top_3]))
 
     if not equity.empty:
         table.add_row("Last exposure_usd", str(equity.iloc[-1].get("exposure_usd")))

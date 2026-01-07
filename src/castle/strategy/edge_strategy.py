@@ -1,5 +1,3 @@
-# REPLACE src/castle/strategy/edge_strategy.py WITH THIS ENTIRE FILE:
-
 from __future__ import annotations
 
 import datetime as dt
